@@ -26,6 +26,15 @@ $url  = "/cgi-bin/mjpg/video.cgi?channel=0&subtype=1";
 // username:password if no auth is required, set $auth to value false
 $auth = "my_username:my_password_123";
 
+//if upstream camera uses self-signed certificates regular verification options fail
+//the fingerprint (SHA-1, lower case, no ':') can still be verified
+//example #1: $fingerprint = '1234567890abcdef1234567890abcdef12345678'
+//example #2: $fingerprint = openssl_x509_fingerprint(file_get_contents('camera.pem'))
+//example #3: $fingerprint = false; //rely on defaults
+//$fingerprint = openssl_x509_fingerprint(file_get_contents('camera.pem'));
+//So far this does not work, so we ignore fingerprint for now:
+$fingerprint = '1234567890abcdef1234567890abcdef12345678';
+
 //This script grants access by username and password
 //Either by Basic auth or by passing those values as GET parameter
 $user = "another_username";
@@ -75,8 +84,7 @@ $key = ftok(__FILE__, 'a');
 $shm = shm_attach($key, 1024*1024, 0600) or die("shm_attach failed");
 
 //get IDs of mutexes, all mutexes will be auto-released on exit
-$role_writer_mutex_id = sem_get($key, 1, 0600, true) or die("1: sem_get failed");
-$shm_mutex_id = sem_get($key+1, 1, 0600, true) or die("2: sem_get failed");
+$shm_mutex_id = sem_get($key, 1, 0600, true) or die("sem_get failed");
 
 //send headers
 header('Cache-Control: no-cache');
@@ -148,7 +156,7 @@ function DebugMessage($str, $seconds=4) {
 
 	for($i=0; $i<$seconds*5; $i++) {
 		OutputImage(TextToImage("$i: ".$str));
-		usleep(100*1000);
+		usleep(200*1000);
 	}
 }
 
@@ -159,7 +167,7 @@ Return Value: "false" in case of errors
               JPEG encoded image if function succeeds
 ******************************************************************************/
 function GetImageFromUpstreamCamera() {
-	global $auth, $host, $port, $url, $boundaryIn;
+	global $auth, $host, $port, $url, $boundaryIn, $fingerprint;
 
 	//filepointer for reading from upstream webcam
 	static $fp = false;
@@ -169,19 +177,28 @@ function GetImageFromUpstreamCamera() {
 	//open filepointer to upstream camera if not already open
 	if($fp === false) {
 		DebugMessage("opening fp");
-		//$fp = @fsockopen($host, $port, $errno, $errstr, 10);
 		/*
-         * if the camera cert is self-signed, maybe ignore TLS certificate details
-         * WARNING: MITM is possible when setting verify... to false!
+         * if the camera cert is self-signed, maybe you need to ignore TLS certificate details
+         * WARNING: MITM is possible when setting verify... to false
+         * 
+         * Documentation is at: https://www.php.net/manual/en/context.ssl.php
          */
-		$context = stream_context_create([
-			'ssl' => [
-				'verify_peer' => false,
-				'verify_peer_name' => false
-			]
-		]);
-		//establish connection to upstream camera
-		$fp = stream_socket_client("$host:$port", $errno, $errstr, ini_get("default_socket_timeout"), STREAM_CLIENT_CONNECT, $context);
+        if ($fingerprint !== false) {
+			DebugMessage("connect to camera with fingerprint: ". $fingerprint);
+			$context = stream_context_create([
+				'ssl' => [
+					'verify_peer' => false,
+					//'allow_self_signed' => true,
+					//'peer_fingerprint' =>  $fingerprint, //could not make it work so far
+					'verify_peer_name' => false
+				]
+			]);
+			//establish connection to upstream camera with dodgy cert
+			$fp = stream_socket_client("$host:$port", $errno, $errstr, ini_get("default_socket_timeout"), STREAM_CLIENT_CONNECT, $context);
+		} else {
+			//establish regular connection to upstream camera
+			$fp = @fsockopen($host, $port, $errno, $errstr, ini_get("default_socket_timeout"));
+		}
 		if ($fp === false) {
 			DebugMessage("Input failed (FP: ". json_encode($fp).", $errstr)");
 			return false;
@@ -317,9 +334,15 @@ function GetImageFromSharedMemory($timeout = 5) {
 		} else {
 			//yay, this is a new image
 			$img = shm_get_var($shm, 0);
+
+			//if image is emtpy writer is currently busy, try again later
+			if(strlen($img) == 0) {
+				$img = true;
+			}
 		}
+		$timestamp_previous = $timestamp;
 	}
-	
+
 	//Leaving critical section
 	if( !sem_release($shm_mutex_id) ) {
 		DebugMessage("sem_release for image failed");
@@ -328,18 +351,73 @@ function GetImageFromSharedMemory($timeout = 5) {
 	return $img;
 }
 
+/******************************************************************************
+Description.: determine if we are writer or reader
+Input Value.: $timeout defines how old previous writer output must be,
+              before we declare this instance to be a writer
+Return Value: true for writer
+              false for reader
+******************************************************************************/
+function RoleIsWriter($timeout = 5) {
+	global $shm, $shm_mutex_id;
+
+	//Enter critical section for accessing shared memory, blocking
+	$shm_mutex = sem_acquire($shm_mutex_id, false);
+
+	//get timestamp from shared memory
+	if( !shm_has_var($shm, 1) ) {
+		DebugMessage("shm_has_var for timestamp is not there");
+		$timestamp = 0;
+	} else {
+		$timestamp = shm_get_var($shm, 1);
+	}
+
+	//access pid of writer
+	if( !shm_has_var($shm, 2) ) {
+		//there is no writer yet, so we start doing it, place our PID
+		$writerPid = NULL;
+	} else {
+		$writerPid = shm_get_var($shm, 2);
+	}
+
+	$role = NULL;
+	if( $writerPid == getmypid() ) {
+		//we are already writer
+		$role = true;
+	} elseif (microtime(true) - $timestamp > $timeout) {
+		DebugMessage("Timestamp is old, becoming writer: ". microtime(true) - $timestamp);
+		//timestamp is old, we become a writer
+		$role = true;
+		shm_put_var($shm, 2, getmypid());
+		//place an emtpy image, because that is all we can offer right now
+		shm_put_var($shm, 0, "");
+		//update timestamp to signal the new frame, which is empty
+		shm_put_var($shm, 1, microtime(true));
+	} else {
+		//we will remain a reader
+		$role = false;
+	}
+
+	//Leaving critical section
+	if( !sem_release($shm_mutex_id) ) {
+		DebugMessage("sem_release for image failed");
+	}
+
+	return $role;
+}
+
 /* 
  * writer is the one talking to the upstream camera
  * readers (normally) do not talk directly to the upstream camera
  */
 
-//if we get the mutex, we assume to be a writer otherwise we are reader
-$role_writer_mutex = sem_acquire($role_writer_mutex_id, true);
+//if we get the writer role we connect to the upstream camera
+$role_writer = RoleIsWriter(5);
 
 while(true) {
-	if($role_writer_mutex) {
+	if($role_writer) {
 		DebugMessage("Role is Writer");
-		ignore_user_abort(true);
+		//ignore_user_abort(true);
 
 		while(($img = GetImageFromUpstreamCamera()) !== false) {
 			if( $debug )
@@ -357,27 +435,27 @@ while(true) {
 		DebugMessage("Role is Reader");
 
 		while(true) {
-			//try to get image from shared memory (within timeout)
+			//try to get image from shared memory (with timeout)
 			$img = GetImageFromSharedMemory(5);
 
-			//true, we could read image, but it did not change
+			//try to become a writer, which suceeds if other writer exits
+			$role_writer = RoleIsWriter(5);
+			if( $role_writer ) {
+				DebugMessage("Switching role to writer");
+				break;
+			}
+
+			//true, we could read image, but it did not change or is empty
 			if( $img === true ) {
 				usleep(100*1000);
 				continue;
 			}
 
-			//try to become a writer, which suceeds if other writer exits
-			$role_writer_mutex = sem_acquire($role_writer_mutex_id, true);
-			if( $role_writer_mutex ) {
-				DebugMessage("Switching role to writer");
-				break;
-			}
-
 			//false, we are reader and have no image, timeout occured
 			if ( $img === false ) {
-				DebugMessage("Role is Reader, but reading image failed, so we establish our own connection");
-				$img = GetImageFromUpstreamCamera() or die();
-				WriteImageToSharedMemory($img);
+				DebugMessage("Role is Reader, but reading image failed");
+				usleep(100*1000);
+				continue;
 			}
 
 			if( $debug )
