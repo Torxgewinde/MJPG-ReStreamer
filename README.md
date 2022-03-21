@@ -7,3 +7,6 @@ In contrast to common HTTP(s) reverse-proxies this script just passes the MJPEG 
 ```
 <img src="index.php"/>
 ```
+
+## Caching, multiple connections, saving bandwidth to upstream camera
+MJPG-ReStreamer uses a shared memory segment to limit the bandwidth to the upstream MJPEG-camera. If multiple clients connect they get served the images from the shared memory. If the first instance stops working one of the other instances will connect to the upstream camera and update all other instances.
