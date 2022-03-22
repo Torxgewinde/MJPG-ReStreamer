@@ -10,3 +10,7 @@ In contrast to common HTTP(s) reverse-proxies this script just passes the MJPEG 
 
 ## Caching, multiple connections, saving bandwidth to upstream camera
 MJPG-ReStreamer uses a shared memory segment to limit the bandwidth to the upstream MJPEG-camera. If multiple clients connect they get served the images from the shared memory. If the first instance stops working one of the other instances will connect to the upstream camera and update all other instances.
+
+## Simulated IP camera
+To test without an IP camera you can use the script `simulated_camera.php`.
+<img src="simulated_camera.gif"></img>
