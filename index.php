@@ -431,6 +431,12 @@ while(true) {
 				exit;
 			set_time_limit(1);
 		}
+
+		$img = TextToImage("Writer: could not get image from upstream camera (".date("Y-m-d H:i:s").")");
+		for($i=0; $i<10; $i++) {
+			OutputImage($img);
+			usleep(200*1000);
+		}
 	} else {
 		DebugMessage("Role is Reader");
 
