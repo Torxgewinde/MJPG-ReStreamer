@@ -31,6 +31,7 @@ header('Pragma: no-cache');
 header('Expires: Sat, 01 Jan 2000 01:00:00 GMT');
 header('Connection: close');
 header('Script-Info: MJPG-ReStreamer');
+header('X-Accel-Buffering: no');
 header("Content-Type: multipart/x-mixed-replace; boundary=$boundaryOut");
 echo "--$boundaryOut\r\n";
 flush();
